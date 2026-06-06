@@ -149,14 +149,11 @@ __global__ void prepack_b_tiles(int dim_n, int dim_k, const float *d_b, half *pa
   }
 }
 
-__device__ void tma_copy_packed_tiles(const CUtensorMap *map_a, int tile_a, half *dst_a,
-                                      const CUtensorMap *map_b, int tile_b, half *dst_b,
-                                      uint64_t *bar) {
+__device__ void tma_copy_packed_tiles_issue(const CUtensorMap *map_a, int tile_a, half *dst_a,
+                                            const CUtensorMap *map_b, int tile_b, half *dst_b,
+                                            uint64_t *bar) {
   namespace ptx = cuda::ptx;
   constexpr uint32_t tile_bytes = 8192 * sizeof(half);
-  if (threadIdx.x == 0)
-    ptx::mbarrier_init(bar, 1);
-  __syncthreads();
   if (threadIdx.x == 0) {
     const int32_t coords_a[2] = {0, tile_a * 128};
     const int32_t coords_b[2] = {0, tile_b * 128};
@@ -167,9 +164,24 @@ __device__ void tma_copy_packed_tiles(const CUtensorMap *map_a, int tile_a, half
     ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta,
                                    ptx::space_shared, bar, 2 * tile_bytes);
   }
-  __syncthreads();
+}
+
+__device__ void tma_copy_packed_tiles_wait(uint64_t *bar) {
+  namespace ptx = cuda::ptx;
   while (!ptx::mbarrier_try_wait_parity(bar, 0))
     ;
+}
+
+__device__ void tma_copy_packed_tiles_sync(const CUtensorMap *map_a, int tile_a, half *dst_a,
+                                           const CUtensorMap *map_b, int tile_b, half *dst_b,
+                                           uint64_t *bar) {
+  namespace ptx = cuda::ptx;
+  if (threadIdx.x == 0)
+    ptx::mbarrier_init(bar, 1);
+  __syncthreads();
+  tma_copy_packed_tiles_issue(map_a, tile_a, dst_a, map_b, tile_b, dst_b, bar);
+  __syncthreads();
+  tma_copy_packed_tiles_wait(bar);
   __syncthreads();
 }
 
@@ -181,7 +193,7 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
 
   __shared__ __align__(1024) half block_a[2][8192];
   __shared__ __align__(1024) half block_b[2][8192];
-  __shared__ uint64_t bulk_bar;
+  __shared__ uint64_t bulk_bar[2];
 
   float acc[2][64];
   for (int r = 0; r < 2; r++)
@@ -201,8 +213,8 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
   wgmma_fence();
   int tile_a0 = blockIdx.x * ktile_count;
   int tile_b0 = blockIdx.y * ktile_count;
-  tma_copy_packed_tiles(map_a, tile_a0, block_a[0],
-                        map_b, tile_b0, block_b[0], &bulk_bar);
+  tma_copy_packed_tiles_sync(map_a, tile_a0, block_a[0],
+                             map_b, tile_b0, block_b[0], &bulk_bar[0]);
 
   for (int ktile = 0; ktile < ktile_count; ktile++) {
     int stage = ktile & 1;
@@ -212,13 +224,23 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
     wgmma_m64n128k16(desc_a0[stage], desc_b[stage], acc[0]);
     wgmma_m64n128k16(desc_a1[stage], desc_b[stage], acc[1]);
     wgmma_commit();
-    if (ktile + 1 < ktile_count) {
+
+    bool has_next = ktile + 1 < ktile_count;
+    if (has_next) {
+      if (threadIdx.x == 0)
+        cuda::ptx::mbarrier_init(&bulk_bar[next_stage], 1);
+      __syncthreads();
+    }
+
+    if (has_next) {
       int tile_a = blockIdx.x * ktile_count + ktile + 1;
       int tile_b = blockIdx.y * ktile_count + ktile + 1;
-      tma_copy_packed_tiles(map_a, tile_a, block_a[next_stage],
-                            map_b, tile_b, block_b[next_stage], &bulk_bar);
+      tma_copy_packed_tiles_issue(map_a, tile_a, block_a[next_stage],
+                                  map_b, tile_b, block_b[next_stage], &bulk_bar[next_stage]);
     }
     wgmma_wait();
+    if (has_next)
+      tma_copy_packed_tiles_wait(&bulk_bar[next_stage]);
     __syncthreads();
   }
 
@@ -228,8 +250,10 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
   int row1 = row0 + 8;
   int col_pair = 2 * (lane % 4);
 
+#pragma unroll
   for (int ngrp = 0; ngrp < 16; ngrp++) {
     int col = ngrp * 8 + col_pair;
+#pragma unroll
     for (int rb = 0; rb < 2; rb++) {
       int row_base = rb * 64;
       if (offset_a_m + row_base + row0 < dim_m && offset_b_n + col + 1 < dim_n) {
