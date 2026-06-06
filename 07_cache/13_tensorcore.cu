@@ -8,41 +8,118 @@
 using namespace std;
 using namespace nvcuda;
 
+__device__ __forceinline__ unsigned shared_addr(const void *ptr) {
+  unsigned long long addr;
+  asm volatile("cvta.to.shared.u64 %0, %1;" : "=l"(addr) : "l"(ptr));
+  return static_cast<unsigned>(addr);
+}
+
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src) {
+  unsigned dst_addr = shared_addr(dst);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group 0;");
+}
+
+__device__ void async_load_tile(int dim_m, int dim_k, int k,
+                                int offset_a_m, int offset_b_n, int tid, int stride,
+                                const float *d_a, const float *d_b,
+                                float4 stage_a[16][32], float4 stage_b[128][4]) {
+  for (int idx = tid; idx < 16 * 32; idx += stride) {
+    int j = idx / 32;
+    int i4 = idx % 32;
+    const float4 *src = reinterpret_cast<const float4 *>(&d_a[(k + j) * dim_m + offset_a_m + i4 * 4]);
+    cp_async_16(&stage_a[j][i4], src);
+  }
+  for (int idx = tid; idx < 128 * 4; idx += stride) {
+    int col = idx / 4;
+    int j4 = idx % 4;
+    const float4 *src = reinterpret_cast<const float4 *>(&d_b[(offset_b_n + col) * dim_k + k + j4 * 4]);
+    cp_async_16(&stage_b[col][j4], src);
+  }
+}
+
+__device__ void convert_tile(int tid,
+                             int stride,
+                             const float4 stage_a[16][32], const float4 stage_b[128][4],
+                             half block_a[16][128], half block_b[128][16]) {
+  for (int idx = tid; idx < 16 * 32; idx += stride) {
+    int j = idx / 32;
+    int i4 = (idx % 32) * 4;
+    float4 a4 = stage_a[j][idx % 32];
+    *reinterpret_cast<half2 *>(&block_a[j][i4 + 0]) = __floats2half2_rn(a4.x, a4.y);
+    *reinterpret_cast<half2 *>(&block_a[j][i4 + 2]) = __floats2half2_rn(a4.z, a4.w);
+  }
+  for (int idx = tid; idx < 128 * 4; idx += stride) {
+    int col = idx / 4;
+    int j = (idx % 4) * 4;
+    float4 b4 = stage_b[col][idx % 4];
+    *reinterpret_cast<half2 *>(&block_b[col][j + 0]) = __floats2half2_rn(b4.x, b4.y);
+    *reinterpret_cast<half2 *>(&block_b[col][j + 2]) = __floats2half2_rn(b4.z, b4.w);
+  }
+}
+
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       float *d_a, float *d_b, float *d_c) {
-  int offset_a_m = 64 * blockIdx.x;
-  int offset_b_n = 64 * blockIdx.y;
+  int offset_a_m = 128 * blockIdx.x;
+  int offset_b_n = 128 * blockIdx.y;
   int i = threadIdx.x;
   int warp_id = threadIdx.x / 32;
 
-  __shared__ half block_a[16][64];
-  __shared__ half block_b[16][64];
+  __shared__ float4 stage_a[2][16][32];
+  __shared__ float4 stage_b[2][128][4];
+  __shared__ half block_a[2][16][128];
+  __shared__ half block_b[2][128][16];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][8];
   for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 4; c++)
+    for (int c = 0; c < 8; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
+  async_load_tile(dim_m, dim_k, 0, offset_a_m, offset_b_n, i, blockDim.x,
+                  d_a, d_b, stage_a[0], stage_b[0]);
+  cp_async_commit();
+  cp_async_wait();
+  __syncthreads();
+  convert_tile(i, blockDim.x, stage_a[0], stage_b[0], block_a[0], block_b[0]);
+  __syncthreads();
+
   for (int k = 0; k < dim_k; k += 16) {
-    __syncthreads();
-    for (int j = 0; j < 16; ++j) {
-      block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
-      block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
+    int stage = (k / 16) & 1;
+    int next_stage = stage ^ 1;
+    bool has_next = k + 16 < dim_k;
+    if (has_next) {
+      async_load_tile(dim_m, dim_k, k + 16, offset_a_m, offset_b_n, i, blockDim.x,
+                      d_a, d_b, stage_a[next_stage], stage_b[next_stage]);
+      cp_async_commit();
     }
-    __syncthreads();
     for (int r = 0; r < 2; r++) {
       int row_tile = warp_id * 2 + r;
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
-      for (int c = 0; c < 4; c++) {
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], 64);
+      wmma::load_matrix_sync(a_frag, &block_a[stage][0][row_tile * 16], 128);
+      for (int c = 0; c < 8; c++) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+        wmma::load_matrix_sync(b_frag, &block_b[stage][c * 16][0], 16);
         wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
       }
     }
+    if (has_next) {
+      cp_async_wait();
+      __syncthreads();
+      convert_tile(i, blockDim.x, stage_a[next_stage], stage_b[next_stage],
+                   block_a[next_stage], block_b[next_stage]);
+      __syncthreads();
+    }
   }
+
   for (int r = 0; r < 2; r++) {
-    for (int c = 0; c < 4; c++) {
+    for (int c = 0; c < 8; c++) {
       int c_m = offset_a_m + (warp_id * 2 + r) * 16;
       int c_n = offset_b_n + c * 16;
       if (c_n < dim_n && c_m < dim_m)
@@ -96,9 +173,8 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  int tile = 64;
-  dim3 block = dim3(tile);
-  dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
+  dim3 block = dim3(128);
+  dim3 grid = dim3((m+128-1)/128, (n+128-1)/128);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
     kernel<<< grid, block >>>(m,
