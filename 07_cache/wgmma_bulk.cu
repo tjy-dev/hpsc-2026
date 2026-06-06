@@ -3,43 +3,10 @@
 #include <random>
 #include <stdint.h>
 #include <cublas_v2.h>
-#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda/ptx>
 #include <chrono>
 using namespace std;
-
-void check_cuda_driver(CUresult result, const char *what) {
-  if (result != CUDA_SUCCESS) {
-    const char *name = nullptr;
-    const char *text = nullptr;
-    cuGetErrorName(result, &name);
-    cuGetErrorString(result, &text);
-    fprintf(stderr, "%s failed: %s (%s)\n", what, name ? name : "unknown", text ? text : "unknown");
-    exit(1);
-  }
-}
-
-void encode_packed_tile_map(CUtensorMap *map, half *base, uint64_t tile_count) {
-  const cuuint64_t global_dim[2] = {64, tile_count * 128ULL};
-  const cuuint64_t global_stride[1] = {64 * sizeof(half)};
-  const cuuint32_t box_dim[2] = {64, 128};
-  const cuuint32_t element_stride[2] = {1, 1};
-  check_cuda_driver(
-      cuTensorMapEncodeTiled(map,
-                             CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-                             2,
-                             base,
-                             global_dim,
-                             global_stride,
-                             box_dim,
-                             element_stride,
-                             CU_TENSOR_MAP_INTERLEAVE_NONE,
-                             CU_TENSOR_MAP_SWIZZLE_NONE,
-                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-      "cuTensorMapEncodeTiled");
-}
 
 __device__ __forceinline__ uint64_t insert_bit(uint32_t start_bit, uint64_t target, uint64_t val) {
   return target | (val << start_bit);
@@ -149,21 +116,19 @@ __global__ void prepack_b_tiles(int dim_n, int dim_k, const float *d_b, half *pa
   }
 }
 
-__device__ void tma_copy_packed_tiles(const CUtensorMap *map_a, int tile_a, half *dst_a,
-                                      const CUtensorMap *map_b, int tile_b, half *dst_b,
-                                      uint64_t *bar) {
+__device__ void bulk_copy_packed_tiles(const half *src_a, half *dst_a,
+                                       const half *src_b, half *dst_b,
+                                       uint64_t *bar) {
   namespace ptx = cuda::ptx;
   constexpr uint32_t tile_bytes = 8192 * sizeof(half);
   if (threadIdx.x == 0)
     ptx::mbarrier_init(bar, 1);
   __syncthreads();
   if (threadIdx.x == 0) {
-    const int32_t coords_a[2] = {0, tile_a * 128};
-    const int32_t coords_b[2] = {0, tile_b * 128};
-    ptx::cp_async_bulk_tensor(ptx::space_shared, ptx::space_global,
-                              dst_a, map_a, coords_a, bar);
-    ptx::cp_async_bulk_tensor(ptx::space_shared, ptx::space_global,
-                              dst_b, map_b, coords_b, bar);
+    ptx::cp_async_bulk(ptx::space_cluster, ptx::space_global,
+                       dst_a, src_a, tile_bytes, bar);
+    ptx::cp_async_bulk(ptx::space_cluster, ptx::space_global,
+                       dst_b, src_b, tile_bytes, bar);
     ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta,
                                    ptx::space_shared, bar, 2 * tile_bytes);
   }
@@ -174,7 +139,7 @@ __device__ void tma_copy_packed_tiles(const CUtensorMap *map_a, int tile_a, half
 }
 
 __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
-                            const CUtensorMap *map_a, const CUtensorMap *map_b, float *d_c) {
+                            const half *packed_a, const half *packed_b, float *d_c) {
   int offset_a_m = 128 * blockIdx.x;
   int offset_b_n = 128 * blockIdx.y;
   int ktile_count = (dim_k + 15) / 16;
@@ -201,8 +166,9 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
   wgmma_fence();
   int tile_a0 = blockIdx.x * ktile_count;
   int tile_b0 = blockIdx.y * ktile_count;
-  tma_copy_packed_tiles(map_a, tile_a0, block_a[0],
-                        map_b, tile_b0, block_b[0], &bulk_bar);
+  const half *src_a0 = packed_a + tile_a0 * 8192;
+  const half *src_b0 = packed_b + tile_b0 * 8192;
+  bulk_copy_packed_tiles(src_a0, block_a[0], src_b0, block_b[0], &bulk_bar);
 
   for (int ktile = 0; ktile < ktile_count; ktile++) {
     int stage = ktile & 1;
@@ -215,8 +181,9 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
     if (ktile + 1 < ktile_count) {
       int tile_a = blockIdx.x * ktile_count + ktile + 1;
       int tile_b = blockIdx.y * ktile_count + ktile + 1;
-      tma_copy_packed_tiles(map_a, tile_a, block_a[next_stage],
-                            map_b, tile_b, block_b[next_stage], &bulk_bar);
+      const half *src_a = packed_a + tile_a * 8192;
+      const half *src_b = packed_b + tile_b * 8192;
+      bulk_copy_packed_tiles(src_a, block_a[next_stage], src_b, block_b[next_stage], &bulk_bar);
     }
     wgmma_wait();
     __syncthreads();
@@ -253,7 +220,6 @@ int main(int argc, const char **argv) {
   int Nt = 10;
   float *A, *B, *C, *C2;
   half *Ap, *Bp;
-  CUtensorMap *MapA, *MapB;
   cudaMallocManaged(&A, m * k * sizeof(float));
   cudaMallocManaged(&B, k * n * sizeof(float));
   cudaMallocManaged(&C, m * n * sizeof(float));
@@ -298,8 +264,6 @@ int main(int argc, const char **argv) {
   int ktile_count = (k + 15) / 16;
   cudaMalloc(&Ap, int64_t(mtile_count) * ktile_count * 8192 * sizeof(half));
   cudaMalloc(&Bp, int64_t(ntile_count) * ktile_count * 8192 * sizeof(half));
-  cudaMalloc(&MapA, sizeof(CUtensorMap));
-  cudaMalloc(&MapB, sizeof(CUtensorMap));
   tic = chrono::steady_clock::now();
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
@@ -309,18 +273,12 @@ int main(int argc, const char **argv) {
   }
   toc = chrono::steady_clock::now();
   double tprepack = chrono::duration<double>(toc - tic).count() / Nt;
-  alignas(64) CUtensorMap HostMapA;
-  alignas(64) CUtensorMap HostMapB;
-  encode_packed_tile_map(&HostMapA, Ap, int64_t(mtile_count) * ktile_count);
-  encode_packed_tile_map(&HostMapB, Bp, int64_t(ntile_count) * ktile_count);
-  cudaMemcpy(MapA, &HostMapA, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-  cudaMemcpy(MapB, &HostMapB, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
 
   dim3 block = dim3(128);
   dim3 grid = dim3(mtile_count, ntile_count);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
-    wgmma_kernel<<< grid, block >>>(m, n, k, MapA, MapB, C2);
+    wgmma_kernel<<< grid, block >>>(m, n, k, Ap, Bp, C2);
     cudaDeviceSynchronize();
   }
   toc = chrono::steady_clock::now();
@@ -339,8 +297,6 @@ int main(int argc, const char **argv) {
   printf("error: %lf\n", err/n/m);
   cudaFree(Ap);
   cudaFree(Bp);
-  cudaFree(MapA);
-  cudaFree(MapB);
   cudaFree(A);
   cudaFree(B);
   cudaFree(C);
