@@ -112,19 +112,21 @@ __global__ void prepack_a_tiles(int dim_m, int dim_k, const float *d_a, half *pa
   int tile_k = blockIdx.y;
   int tid = threadIdx.x;
   int offset_a_m = tile_m * 128;
-  int kk = tile_k * 16;
+  int kk = tile_k * 64;
   half *tile = packed_a + (tile_m * gridDim.y + tile_k) * 8192;
 
-  for (int idx = tid; idx < 128 * 16; idx += blockDim.x) {
-    int row = idx / 16;
-    int k_local = idx % 16;
+  for (int idx = tid; idx < 128 * 64; idx += blockDim.x) {
+    int row = idx / 64;
+    int k_local = idx % 64;
     int k_in = k_local % 8;
     int k_core = k_local / 8;
     int row_in = row % 8;
     int row_group = row / 8;
     int smem_idx = swizzle_128b_index(row_group * 512 + row_in * 64 + k_core * 8 + k_in);
     int global_row = offset_a_m + row;
-    tile[smem_idx] = (global_row < dim_m) ? __float2half(d_a[(kk + k_local) * dim_m + global_row]) : __float2half(0.0f);
+    tile[smem_idx] = (global_row < dim_m && kk + k_local < dim_k)
+                         ? __float2half(d_a[(kk + k_local) * dim_m + global_row])
+                         : __float2half(0.0f);
   }
 }
 
@@ -133,10 +135,10 @@ __global__ void prepack_b_tiles(int dim_n, int dim_k, const float *d_b, half *pa
   int tile_k = blockIdx.y;
   int tid = threadIdx.x;
   int offset_b_n = tile_n * 128;
-  int kk = tile_k * 16;
+  int kk = tile_k * 64;
   half *tile = packed_b + (tile_n * gridDim.y + tile_k) * 8192;
 
-  for (int idx = tid; idx < 16 * 128; idx += blockDim.x) {
+  for (int idx = tid; idx < 64 * 128; idx += blockDim.x) {
     int k_local = idx / 128;
     int col = idx % 128;
     int k_in = k_local % 8;
@@ -145,7 +147,9 @@ __global__ void prepack_b_tiles(int dim_n, int dim_k, const float *d_b, half *pa
     int col_group = col / 8;
     int smem_idx = swizzle_128b_index(col_group * 512 + col_in * 64 + k_core * 8 + k_in);
     int global_col = offset_b_n + col;
-    tile[smem_idx] = (global_col < dim_n) ? __float2half(d_b[global_col * dim_k + kk + k_local]) : __float2half(0.0f);
+    tile[smem_idx] = (global_col < dim_n && kk + k_local < dim_k)
+                         ? __float2half(d_b[global_col * dim_k + kk + k_local])
+                         : __float2half(0.0f);
   }
 }
 
@@ -189,7 +193,7 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
                             const CUtensorMap *map_a, const CUtensorMap *map_b, float *d_c) {
   int offset_a_m = 128 * blockIdx.x;
   int offset_b_n = 128 * blockIdx.y;
-  int ktile_count = (dim_k + 15) / 16;
+  int ktile_count = (dim_k + 63) / 64;
 
   __shared__ __align__(1024) half block_a[2][8192];
   __shared__ __align__(1024) half block_b[2][8192];
@@ -200,15 +204,17 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
     for (int x = 0; x < 64; x++)
       acc[r][x] = 0.0f;
 
-  uint64_t desc_a0[2] = {
-      make_wgmma_desc(block_a[0], 64, 1, 1),
-      make_wgmma_desc(block_a[1], 64, 1, 1)};
-  uint64_t desc_a1[2] = {
-      make_wgmma_desc(&block_a[0][4096], 64, 1, 1),
-      make_wgmma_desc(&block_a[1][4096], 64, 1, 1)};
-  uint64_t desc_b[2] = {
-      make_wgmma_desc(block_b[0], 64, 1, 1),
-      make_wgmma_desc(block_b[1], 64, 1, 1)};
+  uint64_t desc_a0[2][4];
+  uint64_t desc_a1[2][4];
+  uint64_t desc_b[2][4];
+  for (int stage = 0; stage < 2; stage++) {
+    for (int k16 = 0; k16 < 4; k16++) {
+      int k_offset = k16 * 16;
+      desc_a0[stage][k16] = make_wgmma_desc(&block_a[stage][k_offset], 64, 1, 1);
+      desc_a1[stage][k16] = make_wgmma_desc(&block_a[stage][4096 + k_offset], 64, 1, 1);
+      desc_b[stage][k16] = make_wgmma_desc(&block_b[stage][k_offset], 64, 1, 1);
+    }
+  }
 
   wgmma_fence();
   int tile_a0 = blockIdx.x * ktile_count;
@@ -221,8 +227,10 @@ __global__ void wgmma_kernel(int dim_m, int dim_n, int dim_k,
     int next_stage = stage ^ 1;
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     wgmma_fence();
-    wgmma_m64n128k16(desc_a0[stage], desc_b[stage], acc[0]);
-    wgmma_m64n128k16(desc_a1[stage], desc_b[stage], acc[1]);
+    for (int k16 = 0; k16 < 4; k16++) {
+      wgmma_m64n128k16(desc_a0[stage][k16], desc_b[stage][k16], acc[0]);
+      wgmma_m64n128k16(desc_a1[stage][k16], desc_b[stage][k16], acc[1]);
+    }
     wgmma_commit();
 
     bool has_next = ktile + 1 < ktile_count;
@@ -319,7 +327,7 @@ int main(int argc, const char **argv) {
 
   int mtile_count = (m + 127) / 128;
   int ntile_count = (n + 127) / 128;
-  int ktile_count = (k + 15) / 16;
+  int ktile_count = (k + 63) / 64;
   cudaMalloc(&Ap, int64_t(mtile_count) * ktile_count * 8192 * sizeof(half));
   cudaMalloc(&Bp, int64_t(ntile_count) * ktile_count * 8192 * sizeof(half));
   cudaMalloc(&MapA, sizeof(CUtensorMap));
