@@ -183,6 +183,7 @@ __device__ void tma_copy_packed_tiles_sync(const CUtensorMap *map_a, int tile_a,
   if (threadIdx.x == 0)
     ptx::mbarrier_init(bar, 1);
   __syncthreads();
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
   tma_copy_packed_tiles_issue(map_a, tile_a, dst_a, map_b, tile_b, dst_b, bar);
   __syncthreads();
   tma_copy_packed_tiles_wait(bar);
@@ -190,7 +191,9 @@ __device__ void tma_copy_packed_tiles_sync(const CUtensorMap *map_a, int tile_a,
 }
 
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
-                       const CUtensorMap *map_a, const CUtensorMap *map_b, float *d_c) {
+                       const __grid_constant__ CUtensorMap map_a,
+                       const __grid_constant__ CUtensorMap map_b,
+                       float *d_c) {
   int offset_a_m = 128 * blockIdx.x;
   int offset_b_n = 128 * blockIdx.y;
   int ktile_count = (dim_k + 63) / 64;
@@ -204,32 +207,24 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     for (int x = 0; x < 64; x++)
       acc[r][x] = 0.0f;
 
-  uint64_t desc_a0[2][4];
-  uint64_t desc_a1[2][4];
-  uint64_t desc_b[2][4];
-  for (int stage = 0; stage < 2; stage++) {
-    for (int k16 = 0; k16 < 4; k16++) {
-      int k_offset = k16 * 16;
-      desc_a0[stage][k16] = make_wgmma_desc(&block_a[stage][k_offset], 64, 1, 1);
-      desc_a1[stage][k16] = make_wgmma_desc(&block_a[stage][4096 + k_offset], 64, 1, 1);
-      desc_b[stage][k16] = make_wgmma_desc(&block_b[stage][k_offset], 64, 1, 1);
-    }
-  }
-
   wgmma_fence();
   int tile_a0 = blockIdx.x * ktile_count;
   int tile_b0 = blockIdx.y * ktile_count;
-  tma_copy_packed_tiles_sync(map_a, tile_a0, block_a[0],
-                             map_b, tile_b0, block_b[0], &bulk_bar[0]);
+  tma_copy_packed_tiles_sync(&map_a, tile_a0, block_a[0],
+                             &map_b, tile_b0, block_b[0], &bulk_bar[0]);
 
   for (int ktile = 0; ktile < ktile_count; ktile++) {
     int stage = ktile & 1;
     int next_stage = stage ^ 1;
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     wgmma_fence();
+    uint64_t desc_a0 = make_wgmma_desc(block_a[stage], 64, 1, 1);
+    uint64_t desc_a1 = make_wgmma_desc(&block_a[stage][4096], 64, 1, 1);
+    uint64_t desc_b = make_wgmma_desc(block_b[stage], 64, 1, 1);
     for (int k16 = 0; k16 < 4; k16++) {
-      wgmma_m64n128k16(desc_a0[stage][k16], desc_b[stage][k16], acc[0]);
-      wgmma_m64n128k16(desc_a1[stage][k16], desc_b[stage][k16], acc[1]);
+      uint64_t desc_offset = 2 * k16;
+      wgmma_m64n128k16(desc_a0 + desc_offset, desc_b + desc_offset, acc[0]);
+      wgmma_m64n128k16(desc_a1 + desc_offset, desc_b + desc_offset, acc[1]);
     }
     wgmma_commit();
 
@@ -243,8 +238,8 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     if (has_next) {
       int tile_a = blockIdx.x * ktile_count + ktile + 1;
       int tile_b = blockIdx.y * ktile_count + ktile + 1;
-      tma_copy_packed_tiles_issue(map_a, tile_a, block_a[next_stage],
-                                  map_b, tile_b, block_b[next_stage], &bulk_bar[next_stage]);
+      tma_copy_packed_tiles_issue(&map_a, tile_a, block_a[next_stage],
+                                  &map_b, tile_b, block_b[next_stage], &bulk_bar[next_stage]);
     }
     wgmma_wait();
     if (has_next)
@@ -285,7 +280,6 @@ int main(int argc, const char **argv) {
   int Nt = 10;
   float *A, *B, *C, *C2;
   half *Ap, *Bp;
-  CUtensorMap *MapA, *MapB;
   cudaMallocManaged(&A, m * k * sizeof(float));
   cudaMallocManaged(&B, k * n * sizeof(float));
   cudaMallocManaged(&C, m * n * sizeof(float));
@@ -328,14 +322,10 @@ int main(int argc, const char **argv) {
   int ktile_count = (k + 63) / 64;
   cudaMalloc(&Ap, int64_t(mtile_count) * ktile_count * 8192 * sizeof(half));
   cudaMalloc(&Bp, int64_t(ntile_count) * ktile_count * 8192 * sizeof(half));
-  cudaMalloc(&MapA, sizeof(CUtensorMap));
-  cudaMalloc(&MapB, sizeof(CUtensorMap));
   alignas(64) CUtensorMap HostMapA;
   alignas(64) CUtensorMap HostMapB;
   encode_packed_tile_map(&HostMapA, Ap, int64_t(mtile_count) * ktile_count);
   encode_packed_tile_map(&HostMapB, Bp, int64_t(ntile_count) * ktile_count);
-  cudaMemcpy(MapA, &HostMapA, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-  cudaMemcpy(MapB, &HostMapB, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
 
   dim3 block = dim3(128);
   dim3 grid = dim3((m+128-1)/128, (n+128-1)/128);
@@ -346,8 +336,8 @@ int main(int argc, const char **argv) {
     kernel<<< grid, block >>>(m,
 			      n,
 			      k,
-			      MapA,
-			      MapB,
+			      HostMapA,
+			      HostMapB,
 			      C2);
     cudaDeviceSynchronize();
   }
@@ -364,8 +354,6 @@ int main(int argc, const char **argv) {
   printf("error: %lf\n", err/n/m);
   cudaFree(Ap);
   cudaFree(Bp);
-  cudaFree(MapA);
-  cudaFree(MapB);
   cudaFree(A);
   cudaFree(B);
   cudaFree(C);
