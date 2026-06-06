@@ -25,7 +25,7 @@
 12_vector_4x2: 12_vector_4x2.cu
 	nvcc 12_vector_4x2.cu -Xcompiler "-O3 -fopenmp" -lcublas
 13_tensorcore: 13_tensorcore.cu
-	nvcc 13_tensorcore.cu -gencode arch=compute_90a,code=sm_90a -Xcompiler "-O3 -fopenmp" -lcublas
+	nvcc 13_tensorcore.cu -gencode arch=compute_90a,code=sm_90a -Xcompiler "-O3 -fopenmp" -lcublas -lcuda
 14_wgmma: 14_wgmma.cu
 	nvcc 14_wgmma.cu -gencode arch=compute_90a,code=sm_90a -Xcompiler "-O3 -fopenmp" -lcublas -lcuda
 wgmma_tma: wgmma_tma.cu
